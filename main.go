@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -25,25 +26,18 @@ import (
 	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
 	"github.com/joho/godotenv"
-	"github.com/onrik/ethrpc"
 )
 
 const (
-	transferABI      = `[{"anonymous":false,"inputs":[{"indexed":true,"name":"from","type":"address"},{"indexed":true,"name":"to","type":"address"},{"indexed":false,"name":"value","type":"uint256"}],"name":"Transfer","type":"event"}]`
-	getBalanceABI    = `[{"constant":true,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"payable":false,"stateMutability":"view","type":"function"}]`
-	initialSupplyStr = "100000000000000000000000000000" // 100 billion CHAOS in Wei
-
-	aixbtWallet = "0xea36d66f0ac9928b358400309a8dfbc43a973a35"
-	burnAddress = "0x000000000000000000000000000000000000dead"
-
-	tokenAddress = "0x20d704099B62aDa091028bcFc44445041eD16f09"
-	fromAddress  = "0xdecaf122e4d89afbcecc341ecfe9987a67cdf93e"
-	toAddress    = "0xC3E823489A201a8654646496b3c318A8c6C9B881"
+	transferEventABI      = `[{"anonymous":false,"inputs":[{"indexed":true,"name":"from","type":"address"},{"indexed":true,"name":"to","type":"address"},{"indexed":false,"name":"value","type":"uint256"}],"name":"Transfer","type":"event"}]`
+	getBalanceFunctionABI = `[{"constant":true,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"payable":false,"stateMutability":"view","type":"function"}]`
+	initialSupplyStr      = "100000000000000000000000000000" // 100 billion CHAOS in Wei
 )
 
 var (
-	contractAddress = common.HexToAddress(tokenAddress)
-	walletAddress   = common.HexToAddress(burnAddress)
+	contractAddress = common.HexToAddress("0x20d704099B62aDa091028bcFc44445041eD16f09")
+	fromAddress     = common.HexToAddress("0xea36d66f0AC9928b358400309a8dFbC43A973a35")
+	toAddress       = common.HexToAddress("0x000000000000000000000000000000000000dEaD")
 )
 
 // loadEnv loads environment variables from a .env file.
@@ -75,29 +69,6 @@ func getRandomMessage() string {
 	return messages[rand.Intn(len(messages))]
 }
 
-func healthServer() {
-	var terminationSignalChannel = make(chan os.Signal, 1)
-	signal.Notify(terminationSignalChannel, os.Interrupt, syscall.SIGTERM)
-
-	waitGroup := &sync.WaitGroup{}
-
-	startHealthServer("0.0.0.0:8080")
-
-	sc := make(chan os.Signal, 1)
-	signal.Notify(sc, syscall.SIGINT, syscall.SIGTERM, os.Interrupt, os.Kill)
-	<-sc
-
-	for {
-		select {
-		case <-terminationSignalChannel:
-			fmt.Printf("shutting down server...")
-			waitGroup.Wait()
-			close(terminationSignalChannel)
-			os.Exit(0)
-		}
-	}
-}
-
 func startHealthServer(addr string) *http.Server {
 	// HTTP Gateway server
 	router := mux.NewRouter()
@@ -112,7 +83,7 @@ func startHealthServer(addr string) *http.Server {
 		Handler:           handlers.LoggingHandler(os.Stdout, router),
 	}
 	go func() {
-		fmt.Printf("starting HTTP main server on %s", addr)
+		fmt.Printf("starting HTTP main server on %s\n", addr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			panic(fmt.Sprintf("error starting HTTP main server: %v", err))
 		}
@@ -125,149 +96,156 @@ func HandleHealth(w http.ResponseWriter, r *http.Request) {
 	return
 }
 
-// sendTelegramMessage sends a message and an image to a Telegram channel.
-func sendTelegramMessage(bot *tgbotapi.BotAPI, channelID string, message string, imageURL string) {
+func sendTelegramMessage(bot *tgbotapi.BotAPI, channelID string, message string, mediaURL string, isGIF bool) {
 	log.Println("Sending message to Telegram channel...")
-	if len(imageURL) > 0 {
-		photo := tgbotapi.NewPhotoToChannel(channelID, tgbotapi.FileURL(imageURL))
+	if isGIF {
+		// Send a GIF (Animation)
+		atoi, err := strconv.Atoi(channelID)
+		if err != nil {
+			log.Printf("Error parsing channelid: %v", err)
+		}
+		animation := tgbotapi.NewAnimation(int64(atoi), tgbotapi.FileURL(mediaURL))
+
+		animation.Caption = message
+		if _, err := bot.Send(animation); err != nil {
+			log.Printf("Error sending message with GIF: %v", err)
+		} else {
+			log.Println("Message with GIF sent successfully.")
+		}
+	} else {
+		// Send an image
+		photo := tgbotapi.NewPhotoToChannel(channelID, tgbotapi.FileURL(mediaURL))
 		photo.Caption = message
 		if _, err := bot.Send(photo); err != nil {
 			log.Printf("Error sending message with photo: %v", err)
 		} else {
 			log.Println("Message with photo sent successfully.")
 		}
-	} else {
-		photo := tgbotapi.NewMessageToChannel(channelID, message)
-		if _, err := bot.Send(photo); err != nil {
-			log.Printf("Error sending message: %v", err)
-		} else {
-			log.Println("Message sent successfully.")
-		}
 	}
 }
 
 // monitorBurns subscribes to new blocks and processes transactions for burn events.
-func monitorBurns(wssClient *ethclient.Client, httpClient *ethrpc.EthRPC, bot *tgbotapi.BotAPI, channelID string, imageURL string) {
+func monitorBurns(ctx context.Context, waitGroup *sync.WaitGroup, wssClient *ethclient.Client, bot *tgbotapi.BotAPI, channelID string, imageURL string) {
 	log.Println("Started monitoring for burns...")
 
-	headers := make(chan *types.Header)
-	sub, err := wssClient.SubscribeNewHead(context.Background(), headers)
-	if err != nil {
-		log.Fatalf("Failed to subscribe to new blocks: %v", err)
+	// Transfer event signature (ERC-20 Transfer event: Transfer(address,address,uint256))
+	transferEventSignature := []byte("Transfer(address,address,uint256)")
+	transferEventTopic := crypto.Keccak256Hash(transferEventSignature)
+
+	query := ethereum.FilterQuery{
+		Addresses: []common.Address{contractAddress},
+		Topics: [][]common.Hash{
+			{transferEventTopic},
+			{common.BytesToHash(fromAddress.Bytes())},
+			{common.BytesToHash(toAddress.Bytes())},
+		},
 	}
+
+	log.Println("Subscribing to burn events...")
+	logsChannel := make(chan types.Log)
+	sub, err := wssClient.SubscribeFilterLogs(ctx, query, logsChannel)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Println("Subscription obtained successfully")
 
 	for {
 		select {
 		case err := <-sub.Err():
 			log.Printf("Subscription error: %v", err)
 			return
-		case header := <-headers:
-			blockNumber := header.Number.Uint64()
-			log.Printf("New block detected: %d", blockNumber)
+		case <-ctx.Done():
+			log.Println("Subscription finished by cancelation")
+			waitGroup.Done()
+			return
+		case vLog := <-logsChannel:
+			log.Printf("Log received: %+v", vLog)
+			processLog(ctx, vLog, wssClient, bot, channelID, imageURL)
+		}
+	}
+}
 
-			// Fetch the full block
-			block, err := httpClient.EthGetBlockByNumber(int(blockNumber), true)
-			if err != nil {
-				log.Printf("Error fetching block: %v", err)
-				continue
-			}
+func processLog(ctx context.Context, vLog types.Log, wssClient *ethclient.Client, bot *tgbotapi.BotAPI, channelID string, imageURL string) {
+	// ABI for the smart contract (include only relevant events)
+	contractABI, err := abi.JSON(strings.NewReader(transferEventABI))
+	if err != nil {
+		log.Fatalf("Failed to parse ABI: %v", err)
+	}
 
-			// Process transactions in the block
-			for _, tx := range block.Transactions {
-				// Check if the transaction is from the monitored wallet to the burn address
-				if strings.EqualFold(tx.From, fromAddress) && strings.EqualFold(tx.To, toAddress) {
+	// Decode the log
+	event := struct {
+		From  common.Address
+		To    common.Address
+		Value *big.Int
+	}{}
 
-					// Transfer event signature (ERC-20 Transfer event: Transfer(address,address,uint256))
-					transferEventSignature := []byte("Transfer(address,address,uint256)")
-					transferEventTopic := crypto.Keccak256Hash(transferEventSignature)
+	err = contractABI.UnpackIntoInterface(&event, "Transfer", vLog.Data)
+	if err != nil {
+		log.Fatalf("Failed to unpack log: %v", err)
+	}
 
-					// Create a filter query for logs in the specific block
-					query := ethereum.FilterQuery{
-						FromBlock: header.Number,
-						ToBlock:   header.Number,
-						Addresses: []common.Address{contractAddress},
-						Topics:    [][]common.Hash{{transferEventTopic}}, // Topic[0] is the event signature
-					}
+	// Extract indexed topics (from and to)
+	event.From = common.HexToAddress(vLog.Topics[1].Hex())
+	event.To = common.HexToAddress(vLog.Topics[2].Hex())
 
-					// Fetch logs from the block
-					logs, err := wssClient.FilterLogs(context.Background(), query)
-					if err != nil {
-						log.Fatalf("Failed to fetch logs: %v", err)
-					}
+	log.Printf("Transfer Event: From %s To %s Value %s", event.From.Hex(), event.To.Hex(), event.Value.String())
 
-					// ABI of the contract (only include Transfer event for simplicity)
-					contractABI, err := abi.JSON(strings.NewReader(transferABI))
-					if err != nil {
-						log.Fatalf("Failed to parse contract ABI: %v", err)
-					}
+	notifyTelegram(ctx, event, wssClient, bot, channelID, imageURL)
+}
 
-					// Process each log
-					for _, vLog := range logs {
-						// Unpack log data using ABI
-						event := struct {
-							From  common.Address
-							To    common.Address
-							Value *big.Int
-						}{}
-						err := contractABI.UnpackIntoInterface(&event, "Transfer", vLog.Data)
-						if err != nil {
-							log.Fatalf("Failed to unpack log data: %v", err)
-						}
+func notifyTelegram(ctx context.Context, event struct {
+	From  common.Address
+	To    common.Address
+	Value *big.Int
+}, wssClient *ethclient.Client, bot *tgbotapi.BotAPI, channelID string, imageURL string) {
+	// Token has 18 decimals, so divide by 10^18
+	decimals := big.NewInt(1e18)
+	humanReadableValue := new(big.Float).Quo(new(big.Float).SetInt(event.Value), new(big.Float).SetInt(decimals))
 
-						// Extract indexed fields from topics
-						event.From = common.HexToAddress(vLog.Topics[1].Hex())
-						event.To = common.HexToAddress(vLog.Topics[2].Hex())
+	// Truncate the value to an integer
+	intValue := new(big.Int)
+	humanReadableValue.Int(intValue) // Converts the float to its integer part
 
-						if strings.EqualFold(event.From.String(), aixbtWallet) && strings.EqualFold(event.To.String(), burnAddress) {
+	// Parse the ERC-20 ABI
+	parsedABI, err := abi.JSON(strings.NewReader(getBalanceFunctionABI))
+	if err != nil {
+		log.Fatalf("Failed to parse ABI: %v", err)
+	}
 
-							// Token has 18 decimals, so divide by 10^18
-							decimals := big.NewInt(1e18)
-							humanReadableValue := new(big.Float).Quo(new(big.Float).SetInt(event.Value), new(big.Float).SetInt(decimals))
+	// Prepare the call data for the balanceOf function
+	data, err := parsedABI.Pack("balanceOf", toAddress)
+	if err != nil {
+		log.Fatalf("Failed to pack data for balanceOf function: %v", err)
+	}
 
-							// Truncate the value to an integer
-							intValue := new(big.Int)
-							humanReadableValue.Int(intValue) // Converts the float to its integer part
+	// Call the contract to get the balance
+	result, err := wssClient.CallContract(ctx, ethereum.CallMsg{
+		To:   &contractAddress,
+		Data: data,
+	}, nil)
+	if err != nil {
+		log.Fatalf("Failed to call contract: %v", err)
+	}
 
-							// Parse the ERC-20 ABI
-							parsedABI, err := abi.JSON(strings.NewReader(getBalanceABI))
-							if err != nil {
-								log.Fatalf("Failed to parse ABI: %v", err)
-							}
+	// Unpack the result
+	var balance *big.Int
+	err = parsedABI.UnpackIntoInterface(&balance, "balanceOf", result)
+	if err != nil {
+		log.Fatalf("Failed to unpack result: %v", err)
+	}
 
-							// Prepare the call data for the balanceOf function
-							data, err := parsedABI.Pack("balanceOf", walletAddress)
-							if err != nil {
-								log.Fatalf("Failed to pack data for balanceOf function: %v", err)
-							}
+	// Calculate the percentage burned
+	initialSupply, _ := new(big.Float).SetString(initialSupplyStr)
+	burnedFloat := new(big.Float).SetInt(balance)
+	percentBurned := new(big.Float).Quo(burnedFloat, initialSupply)
+	percentBurned.Mul(percentBurned, big.NewFloat(100))
 
-							// Call the contract to get the balance
-							result, err := wssClient.CallContract(context.Background(), ethereum.CallMsg{
-								To:   &contractAddress,
-								Data: data,
-							}, nil)
-							if err != nil {
-								log.Fatalf("Failed to call contract: %v", err)
-							}
+	// Get a random message
+	randomMessage := getRandomMessage()
 
-							// Unpack the result
-							var balance *big.Int
-							err = parsedABI.UnpackIntoInterface(&balance, "balanceOf", result)
-							if err != nil {
-								log.Fatalf("Failed to unpack result: %v", err)
-							}
-
-							// Calculate the percentage burned
-							initialSupply, _ := new(big.Float).SetString(initialSupplyStr)
-							burnedFloat := new(big.Float).SetInt(balance)
-							percentBurned := new(big.Float).Quo(burnedFloat, initialSupply)
-							percentBurned.Mul(percentBurned, big.NewFloat(100))
-
-							// Get a random message
-							randomMessage := getRandomMessage()
-
-							// Prepare the burn message
-							message := fmt.Sprintf(
-								`🔥🔥🔥CHAOS BURN🔥🔥🔥
+	// Prepare the burn message
+	message := fmt.Sprintf(
+		`🔥🔥🔥CHAOS BURN🔥🔥🔥
 
 AIXBT burned: %s $CHAOS
 
@@ -275,21 +253,14 @@ Total Burned: %.2f%% of supply
 
 %s
 
-View Transaction: https://basescan.org/tx/%s`,
-								humanReadableValue.String(),
-								percentBurned,
-								randomMessage,
-								tx.Hash,
-							)
+Burns: https://basescan.org/token/0x20d704099b62ada091028bcfc44445041ed16f09?a=0xea36d66f0ac9928b358400309a8dfbc43a973a35`,
+		humanReadableValue.String(),
+		percentBurned,
+		randomMessage,
+	)
 
-							// SendburnAmount the message with the image
-							sendTelegramMessage(bot, channelID, message, imageURL)
-						}
-					}
-				}
-			}
-		}
-	}
+	// SendburnAmount the message with the image
+	sendTelegramMessage(bot, channelID, message, imageURL, true)
 }
 
 func main() {
@@ -298,10 +269,10 @@ func main() {
 	botToken := os.Getenv("TELEGRAM_BOT_TOKEN")
 	channel := os.Getenv("TELEGRAM_CHANNEL_ID")
 	wssURL := os.Getenv("ETHEREUM_WSS_URL")
-	httpURL := os.Getenv("ETHEREUM_HTTP_URL")
+	//httpURL := os.Getenv("ETHEREUM_HTTP_URL")
 	imageURL := os.Getenv("IMAGE_URL")
 
-	if len(botToken) == 0 || len(wssURL) == 0 || len(httpURL) == 0 || len(imageURL) == 0 {
+	if len(botToken) == 0 || len(channel) == 0 || len(wssURL) == 0 || len(imageURL) == 0 {
 		log.Fatalf("environment variables not set")
 	}
 
@@ -317,12 +288,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to connect to Ethereum client: %v", err)
 	}
-	log.Println("Connected to WSS Ethereum client successfully.")
-
-	// Connect to Ethereum client
-	log.Println("Connecting to HTTP Ethereum client...")
-	httpClient := ethrpc.New(httpURL)
-	log.Println("Connected to HTTP Ethereum client successfully.")
+	log.Println("Connected to WSS Ethereum client successfully")
 
 	// Create Telegram bot
 	log.Println("Initializing Telegram bot...")
@@ -330,39 +296,28 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to create Telegram bot: %v", err)
 	}
-	log.Println("Telegram bot initialized successfully.")
+	log.Println("Telegram bot initialized successfully")
 
-	// Review in which channels is the bot
-	//updates := bot.GetUpdatesChan(tgbotapi.UpdateConfig{})
-	//var channel string
-	//for update := range updates {
-	//	if update.ChannelPost != nil {
-	//		channel = strconv.FormatInt(update.ChannelPost.Chat.ID, 10)
-	//		log.Printf("Channel ID detected: %s", channel)
-	//		break // Exit loop once the channel ID is found
-	//	}
-	//}
-
-	// Test connectivity with Telegram
-	testMessage := "🚀 Bot is online and ready! 🔥"
-	sendTelegramMessage(bot, channel, testMessage, "")
-
-	waitGroup.Add(1)
 	// Start health server to keep alive
-	go healthServer()
-	// Start polling for burn events
-	go monitorBurns(wssClient, httpClient, bot, channel, imageURL)
+	server := startHealthServer("0.0.0.0:8080")
 
-	sc := make(chan os.Signal, 1)
-	signal.Notify(sc, syscall.SIGINT, syscall.SIGTERM, os.Interrupt, os.Kill)
-	<-sc
+	// Prepare routine
+	ctx, cancel := context.WithCancel(context.Background())
+	waitGroup.Add(1)
+	// Start polling for burn events
+	go monitorBurns(ctx, waitGroup, wssClient, bot, channel, imageURL)
 
 	for {
 		select {
 		case <-terminationSignalChannel:
+			log.Println("Signal received, shutting down...")
+			cancel()
+		case <-ctx.Done():
 			fmt.Printf("shutting down server...")
+			server.SetKeepAlivesEnabled(false)
+			err = server.Shutdown(ctx)
 			waitGroup.Wait()
-			close(terminationSignalChannel)
+			fmt.Printf("shutting down successfully")
 			os.Exit(0)
 		}
 	}

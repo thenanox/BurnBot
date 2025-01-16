@@ -297,9 +297,16 @@ func main() {
 	// Load environment variables
 	loadEnv()
 	botToken := os.Getenv("TELEGRAM_BOT_TOKEN")
+	//channel := os.Getenv("TELEGRAM_CHANNEL_ID")
 	wssURL := os.Getenv("ETHEREUM_WSS_URL")
 	httpURL := os.Getenv("ETHEREUM_HTTP_URL")
 	imageURL := os.Getenv("IMAGE_URL")
+
+	var terminationSignalChannel = make(chan os.Signal, 1)
+	signal.Notify(terminationSignalChannel, os.Interrupt, syscall.SIGTERM)
+
+	// cancellable context
+	waitGroup := &sync.WaitGroup{}
 
 	// Connect to Ethereum client
 	log.Println("Connecting to WSS Ethereum client...")
@@ -337,11 +344,23 @@ func main() {
 	testMessage := "🚀 Bot is online and ready! 🔥"
 	sendTelegramMessage(bot, channel, testMessage, "")
 
+	waitGroup.Add(1)
 	// Start health server to keep alive
 	go healthServer()
 	// Start polling for burn events
 	go monitorBurns(wssClient, httpClient, bot, channel, imageURL)
 
-	// Keep the program running
-	select {}
+	sc := make(chan os.Signal, 1)
+	signal.Notify(sc, syscall.SIGINT, syscall.SIGTERM, os.Interrupt, os.Kill)
+	<-sc
+
+	for {
+		select {
+		case <-terminationSignalChannel:
+			fmt.Printf("shutting down server...")
+			waitGroup.Wait()
+			close(terminationSignalChannel)
+			os.Exit(0)
+		}
+	}
 }

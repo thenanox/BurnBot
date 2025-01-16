@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -297,10 +296,14 @@ func main() {
 	// Load environment variables
 	loadEnv()
 	botToken := os.Getenv("TELEGRAM_BOT_TOKEN")
-	//channel := os.Getenv("TELEGRAM_CHANNEL_ID")
+	channel := os.Getenv("TELEGRAM_CHANNEL_ID")
 	wssURL := os.Getenv("ETHEREUM_WSS_URL")
 	httpURL := os.Getenv("ETHEREUM_HTTP_URL")
 	imageURL := os.Getenv("IMAGE_URL")
+
+	if len(botToken) == 0 || len(wssURL) == 0 || len(httpURL) == 0 || len(imageURL) == 0 {
+		log.Fatalf("environment variables not set")
+	}
 
 	var terminationSignalChannel = make(chan os.Signal, 1)
 	signal.Notify(terminationSignalChannel, os.Interrupt, syscall.SIGTERM)
@@ -330,15 +333,15 @@ func main() {
 	log.Println("Telegram bot initialized successfully.")
 
 	// Review in which channels is the bot
-	updates := bot.GetUpdatesChan(tgbotapi.UpdateConfig{})
-	var channel string
-	for update := range updates {
-		if update.ChannelPost != nil {
-			channel = strconv.FormatInt(update.ChannelPost.Chat.ID, 10)
-			log.Printf("Channel ID detected: %s", channel)
-			break // Exit loop once the channel ID is found
-		}
-	}
+	//updates := bot.GetUpdatesChan(tgbotapi.UpdateConfig{})
+	//var channel string
+	//for update := range updates {
+	//	if update.ChannelPost != nil {
+	//		channel = strconv.FormatInt(update.ChannelPost.Chat.ID, 10)
+	//		log.Printf("Channel ID detected: %s", channel)
+	//		break // Exit loop once the channel ID is found
+	//	}
+	//}
 
 	// Test connectivity with Telegram
 	testMessage := "🚀 Bot is online and ready! 🔥"

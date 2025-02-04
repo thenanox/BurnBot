@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -38,6 +39,12 @@ var (
 	contractAddress = common.HexToAddress("0x20d704099B62aDa091028bcFc44445041eD16f09")
 	fromAddress     = common.HexToAddress("0xea36d66f0AC9928b358400309a8dFbC43A973a35")
 	toAddress       = common.HexToAddress("0x000000000000000000000000000000000000dEaD")
+	latestBurnEvent struct {
+		Value      string    `json:"value"`
+		Percentage float64   `json:"percentage_burned"`
+		Timestamp  time.Time `json:"timestamp"`
+	}
+	latestBurnEventMutex sync.RWMutex
 )
 
 // loadEnv loads environment variables from a .env file.
@@ -67,33 +74,6 @@ func getRandomMessage() string {
 	}
 	rand.Seed(time.Now().UnixNano())
 	return messages[rand.Intn(len(messages))]
-}
-
-func startHealthServer(addr string) *http.Server {
-	// HTTP Gateway server
-	router := mux.NewRouter()
-	router.HandleFunc("/api/health", HandleHealth)
-
-	srv := &http.Server{
-		Addr:              addr,
-		WriteTimeout:      time.Second * 15,
-		ReadTimeout:       time.Second * 15,
-		IdleTimeout:       time.Second * 60,
-		ReadHeaderTimeout: time.Second * 15,
-		Handler:           handlers.LoggingHandler(os.Stdout, router),
-	}
-	go func() {
-		fmt.Printf("starting HTTP main server on %s\n", addr)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			panic(fmt.Sprintf("error starting HTTP main server: %v", err))
-		}
-	}()
-
-	return srv
-}
-
-func HandleHealth(w http.ResponseWriter, r *http.Request) {
-	return
 }
 
 func sendTelegramMessage(bot *tgbotapi.BotAPI, channelID string, message string, mediaURL string, isGIF bool) {
@@ -268,6 +248,7 @@ func notifyTelegram(ctx context.Context, event struct {
 	burnedFloat := new(big.Float).SetInt(balance)
 	percentBurned := new(big.Float).Quo(burnedFloat, initialSupply)
 	percentBurned.Mul(percentBurned, big.NewFloat(100))
+	percentBurnedFloat, _ := percentBurned.Float64()
 
 	// Get a random message
 	randomMessage := getRandomMessage()
@@ -290,6 +271,19 @@ Burns: https://basescan.org/token/0x20d704099b62ada091028bcfc44445041ed16f09?a=0
 
 	// SendburnAmount the message with the image
 	sendTelegramMessage(bot, channelID, message, imageURL, true)
+
+	// Update the latest burn event
+	latestBurnEventMutex.Lock()
+	latestBurnEvent = struct {
+		Value      string    `json:"value"`
+		Percentage float64   `json:"percentage_burned"`
+		Timestamp  time.Time `json:"timestamp"`
+	}{
+		Value:      humanReadableValue.String(),
+		Percentage: percentBurnedFloat,
+		Timestamp:  time.Now(),
+	}
+	latestBurnEventMutex.Unlock()
 }
 
 func main() {
@@ -328,7 +322,7 @@ func main() {
 	log.Println("Telegram bot initialized successfully")
 
 	// Start health server to keep alive
-	server := startHealthServer("0.0.0.0:8080")
+	server := startHTTPServer("0.0.0.0:8080")
 
 	// Prepare routine
 	ctx, cancel := context.WithCancel(context.Background())
@@ -344,10 +338,54 @@ func main() {
 		case <-ctx.Done():
 			fmt.Printf("shutting down server...")
 			server.SetKeepAlivesEnabled(false)
-			err = server.Shutdown(ctx)
+			_ = server.Shutdown(ctx)
 			waitGroup.Wait()
 			fmt.Printf("shutting down successfully")
 			os.Exit(0)
 		}
 	}
+}
+
+func startHTTPServer(addr string) *http.Server {
+	// HTTP Gateway server
+	router := mux.NewRouter()
+	router.HandleFunc("/api/health", HandleHealth).Methods("GET")
+	router.HandleFunc("/api/latest-burn", HandleLatestBurnEvent).Methods("GET")
+
+	srv := &http.Server{
+		Addr:              addr,
+		WriteTimeout:      time.Second * 15,
+		ReadTimeout:       time.Second * 15,
+		IdleTimeout:       time.Second * 60,
+		ReadHeaderTimeout: time.Second * 15,
+		Handler:           handlers.LoggingHandler(os.Stdout, router),
+	}
+	go func() {
+		fmt.Printf("starting HTTP main server on %s\n", addr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			panic(fmt.Sprintf("error starting HTTP main server: %v", err))
+		}
+	}()
+
+	return srv
+}
+
+func HandleHealth(w http.ResponseWriter, r *http.Request) {
+	return
+}
+
+func HandleLatestBurnEvent(w http.ResponseWriter, r *http.Request) {
+	latestBurnEventMutex.RLock()
+	defer latestBurnEventMutex.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+
+	// If no burn event has occurred yet
+	if latestBurnEvent.Timestamp.IsZero() {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": "No burn events have occurred yet"})
+		return
+	}
+
+	json.NewEncoder(w).Encode(latestBurnEvent)
 }

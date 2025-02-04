@@ -141,26 +141,55 @@ func monitorBurns(ctx context.Context, waitGroup *sync.WaitGroup, wssClient *eth
 		},
 	}
 
-	log.Println("Subscribing to burn events...")
-	logsChannel := make(chan types.Log)
-	sub, err := wssClient.SubscribeFilterLogs(ctx, query, logsChannel)
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Println("Subscription obtained successfully")
+	// Exponential backoff parameters
+	maxRetryDelay := time.Minute * 5
+	initialRetryDelay := time.Second * 1
+	retryDelay := initialRetryDelay
 
 	for {
 		select {
-		case err := <-sub.Err():
-			log.Printf("Subscription error: %v", err)
-			return
 		case <-ctx.Done():
-			log.Println("Subscription finished by cancelation")
+			log.Println("Subscription finished by cancellation")
 			waitGroup.Done()
 			return
-		case vLog := <-logsChannel:
-			log.Printf("Log received: %+v", vLog)
-			processLog(ctx, vLog, wssClient, bot, channelID, imageURL)
+		default:
+			log.Println("Subscribing to burn events...")
+			logsChannel := make(chan types.Log)
+			sub, err := wssClient.SubscribeFilterLogs(ctx, query, logsChannel)
+			if err != nil {
+				log.Printf("Failed to subscribe: %v. Retrying in %v...", err, retryDelay)
+				time.Sleep(retryDelay)
+
+				// Exponential backoff with jitter
+				retryDelay = time.Duration(float64(retryDelay) * 1.5)
+				jitter := time.Duration(rand.Float64() * float64(retryDelay))
+				retryDelay += jitter
+
+				if retryDelay > maxRetryDelay {
+					retryDelay = maxRetryDelay
+				}
+				continue
+			}
+
+			log.Println("Subscription obtained successfully")
+			retryDelay = initialRetryDelay // Reset retry delay on successful connection
+
+			for {
+				select {
+				case err := <-sub.Err():
+					log.Printf("Subscription error: %v", err)
+					sub.Unsubscribe()
+					break
+				case <-ctx.Done():
+					log.Println("Subscription finished by cancellation")
+					sub.Unsubscribe()
+					waitGroup.Done()
+					return
+				case vLog := <-logsChannel:
+					log.Printf("Log received: %+v", vLog)
+					processLog(ctx, vLog, wssClient, bot, channelID, imageURL)
+				}
+			}
 		}
 	}
 }

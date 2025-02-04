@@ -7,11 +7,13 @@ Right now it is implemented to track one specific wallet burns in an specific co
 To run it locally, it is needed to create an .env file like this:
 
 '''
+ETHEREUM_WSS_URL=<wss url to project>
 TELEGRAM_BOT_TOKEN=<token from bot father in telegram>
-ETHEREUM_RPC_URL=<infura url to project>
-INFURA_API_KEY=<infura key>
-BURN_IMAGE_URL=<url to an image to include in the message>
+TELEGRAM_CHANNEL_ID=<channel id in telegram>
+IMAGE_URL=<url to an image to include in the message>
 '''
+
+PS: for telegram channel id, you can review this link https://gist.github.com/mraaroncruz/e76d19f7d61d59419002db54030ebe35
 
 ### Roadmap
 

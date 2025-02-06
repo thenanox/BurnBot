@@ -107,6 +107,7 @@ func sendTelegramMessage(bot *tgbotapi.BotAPI, channelID string, message string,
 // monitorBurns subscribes to new blocks and processes transactions for burn events.
 func monitorBurns(ctx context.Context, waitGroup *sync.WaitGroup, wssClient *ethclient.Client, bot *tgbotapi.BotAPI, channelID string, imageURL string) {
 	log.Println("Started monitoring for burns...")
+	defer waitGroup.Done()
 
 	// Transfer event signature (ERC-20 Transfer event: Transfer(address,address,uint256))
 	transferEventSignature := []byte("Transfer(address,address,uint256)")
@@ -129,8 +130,7 @@ func monitorBurns(ctx context.Context, waitGroup *sync.WaitGroup, wssClient *eth
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("Subscription finished by cancellation")
-			waitGroup.Done()
+			log.Println("Monitor burns cancelled, shutting down...")
 			return
 		default:
 			log.Println("Subscribing to burn events...")
@@ -139,12 +139,9 @@ func monitorBurns(ctx context.Context, waitGroup *sync.WaitGroup, wssClient *eth
 			if err != nil {
 				log.Printf("Failed to subscribe: %v. Retrying in %v...", err, retryDelay)
 				time.Sleep(retryDelay)
-
-				// Exponential backoff with jitter
 				retryDelay = time.Duration(float64(retryDelay) * 1.5)
 				jitter := time.Duration(rand.Float64() * float64(retryDelay))
 				retryDelay += jitter
-
 				if retryDelay > maxRetryDelay {
 					retryDelay = maxRetryDelay
 				}
@@ -154,17 +151,20 @@ func monitorBurns(ctx context.Context, waitGroup *sync.WaitGroup, wssClient *eth
 			log.Println("Subscription obtained successfully")
 			retryDelay = initialRetryDelay // Reset retry delay on successful connection
 
+		subscriptionLoop:
 			for {
 				select {
-				case err := <-sub.Err():
-					log.Printf("Subscription error: %v", err)
-					sub.Unsubscribe()
-					break
 				case <-ctx.Done():
-					log.Println("Subscription finished by cancellation")
+					log.Println("Monitor burns cancelled, shutting down...")
 					sub.Unsubscribe()
-					waitGroup.Done()
 					return
+				case err := <-sub.Err():
+					if err != nil {
+						log.Printf("Subscription error: %v", err)
+					}
+					log.Println("Subscription ended, reconnecting...")
+					sub.Unsubscribe()
+					break subscriptionLoop // exit inner loop on error
 				case vLog := <-logsChannel:
 					log.Printf("Log received: %+v", vLog)
 					processLog(ctx, vLog, wssClient, bot, channelID, imageURL)

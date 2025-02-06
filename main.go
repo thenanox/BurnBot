@@ -45,7 +45,87 @@ var (
 		Timestamp  time.Time `json:"timestamp"`
 	}
 	latestBurnEventMutex sync.RWMutex
+	activeChannels       = make(map[int64]bool)
+	activeChannelsMutex  sync.RWMutex
 )
+
+func main() {
+	// Load environment variables
+	loadEnv()
+	botToken := os.Getenv("TELEGRAM_BOT_TOKEN")
+	channelIDs := os.Getenv("TELEGRAM_CHANNEL_ID")
+	imageURL := os.Getenv("IMAGE_URL")
+	wssURL := os.Getenv("ETHEREUM_WSS_URL")
+
+	if len(botToken) == 0 || len(wssURL) == 0 || len(imageURL) == 0 {
+		log.Fatalf("environment variables not set")
+	}
+
+	var terminationSignalChannel = make(chan os.Signal, 1)
+	signal.Notify(terminationSignalChannel, os.Interrupt, syscall.SIGTERM)
+
+	// cancellable context
+	waitGroup := &sync.WaitGroup{}
+
+	// Connect to Ethereum client
+	log.Println("Connecting to WSS Ethereum client...")
+	wssClient, err := ethclient.Dial(wssURL)
+	if err != nil {
+		log.Fatalf("Failed to connect to Ethereum client: %v", err)
+	}
+	log.Println("Connected to WSS Ethereum client successfully")
+
+	// Create Telegram bot
+	log.Println("Initializing Telegram bot...")
+	bot, err := tgbotapi.NewBotAPI(botToken)
+	if err != nil {
+		log.Fatalf("Failed to create Telegram bot: %v", err)
+	}
+	bot.Debug = true
+
+	// Initialize bot commands and pre-configured channels
+	if err := initializeBot(bot, channelIDs); err != nil {
+		log.Fatalf("Failed to initialize bot: %v", err)
+	}
+	log.Println("Telegram bot initialized successfully")
+
+	// Start health server to keep alive
+	server := startHTTPServer("0.0.0.0:8080")
+
+	// Set up Telegram updates
+	u := tgbotapi.NewUpdate(0)
+	u.Timeout = 60
+
+	updates := bot.GetUpdatesChan(u)
+
+	// Start handling Telegram updates
+	go func() {
+		for update := range updates {
+			handleTelegramCommand(bot, update)
+		}
+	}()
+
+	// Prepare routine
+	ctx, cancel := context.WithCancel(context.Background())
+	waitGroup.Add(1)
+	// Start polling for burn events
+	go monitorBurns(ctx, waitGroup, wssClient, bot, imageURL)
+
+	for {
+		select {
+		case <-terminationSignalChannel:
+			log.Println("Signal received, shutting down...")
+			cancel()
+		case <-ctx.Done():
+			fmt.Printf("shutting down server...")
+			server.SetKeepAlivesEnabled(false)
+			_ = server.Shutdown(ctx)
+			waitGroup.Wait()
+			fmt.Printf("shutting down successfully")
+			os.Exit(0)
+		}
+	}
+}
 
 // loadEnv loads environment variables from a .env file.
 func loadEnv() {
@@ -76,36 +156,98 @@ func getRandomMessage() string {
 	return messages[rand.Intn(len(messages))]
 }
 
-func sendTelegramMessage(bot *tgbotapi.BotAPI, channelID string, message string, mediaURL string, isGIF bool) {
-	log.Println("Sending message to Telegram channel...")
-	if isGIF {
-		// Send a GIF (Animation)
-		atoi, err := strconv.Atoi(channelID)
-		if err != nil {
-			log.Printf("Error parsing channelid: %v", err)
-		}
-		animation := tgbotapi.NewAnimation(int64(atoi), tgbotapi.FileURL(mediaURL))
+// logActiveChannels prints all active channel IDs in the format CHANNEL_ID=id1;id2;...
+func logActiveChannels() {
+	activeChannelsMutex.RLock()
+	defer activeChannelsMutex.RUnlock()
 
-		animation.Caption = message
-		if _, err := bot.Send(animation); err != nil {
-			log.Printf("Error sending message with GIF: %v", err)
-		} else {
-			log.Println("Message with GIF sent successfully.")
+	var channelIDs []string
+	for channelID := range activeChannels {
+		channelIDs = append(channelIDs, fmt.Sprintf("%d", channelID))
+	}
+	log.Printf("Current active channels - CHANNEL_ID=%s", strings.Join(channelIDs, ";"))
+}
+
+// initializeBot sets up the bot with commands and pre-configured channels
+func initializeBot(bot *tgbotapi.BotAPI, channelIDs string) error {
+	// Set up bot commands
+	commands := []tgbotapi.BotCommand{
+		{
+			Command:     "start",
+			Description: "Start receiving burn notifications in this channel",
+		},
+		{
+			Command:     "stop",
+			Description: "Stop receiving burn notifications in this channel",
+		},
+	}
+
+	cmdConfig := tgbotapi.NewSetMyCommandsWithScope(tgbotapi.NewBotCommandScopeDefault(), commands...)
+	_, err := bot.Request(cmdConfig)
+	if err != nil {
+		return fmt.Errorf("failed to set bot commands: %v", err)
+	}
+
+	// Load pre-configured channels from environment
+	if channelIDs != "" {
+		for _, channelID := range strings.Split(channelIDs, ";") {
+			id, err := strconv.ParseInt(channelID, 10, 64)
+			if err != nil {
+				log.Printf("Invalid channel ID in CHANNEL_ID env var: %s", channelID)
+				continue
+			}
+			activeChannelsMutex.Lock()
+			activeChannels[id] = true
+			activeChannelsMutex.Unlock()
 		}
+		logActiveChannels()
+	}
+
+	return nil
+}
+
+// handleTelegramCommand processes bot commands
+func handleTelegramCommand(bot *tgbotapi.BotAPI, update tgbotapi.Update) {
+	var message *tgbotapi.Message
+	if update.Message != nil {
+		message = update.Message
+	} else if update.ChannelPost != nil {
+		message = update.ChannelPost
 	} else {
-		// Send an image
-		photo := tgbotapi.NewPhotoToChannel(channelID, tgbotapi.FileURL(mediaURL))
-		photo.Caption = message
-		if _, err := bot.Send(photo); err != nil {
-			log.Printf("Error sending message with photo: %v", err)
-		} else {
-			log.Println("Message with photo sent successfully.")
+		return
+	}
+
+	if !message.IsCommand() {
+		return
+	}
+
+	switch message.Command() {
+	case "start":
+		activeChannelsMutex.Lock()
+		activeChannels[message.Chat.ID] = true
+		activeChannelsMutex.Unlock()
+
+		msg := tgbotapi.NewMessage(message.Chat.ID, "🔥 CHAOS Burn Bot activated! You will receive notifications about CHAOS token burns in this channel.")
+		if _, err := bot.Send(msg); err != nil {
+			log.Printf("Error sending start message: %v", err)
 		}
+		logActiveChannels()
+
+	case "stop":
+		activeChannelsMutex.Lock()
+		delete(activeChannels, message.Chat.ID)
+		activeChannelsMutex.Unlock()
+
+		msg := tgbotapi.NewMessage(message.Chat.ID, "CHAOS Burn Bot deactivated. You will no longer receive burn notifications.")
+		if _, err := bot.Send(msg); err != nil {
+			log.Printf("Error sending stop message: %v", err)
+		}
+		logActiveChannels()
 	}
 }
 
 // monitorBurns subscribes to new blocks and processes transactions for burn events.
-func monitorBurns(ctx context.Context, waitGroup *sync.WaitGroup, wssClient *ethclient.Client, bot *tgbotapi.BotAPI, channelID string, imageURL string) {
+func monitorBurns(ctx context.Context, waitGroup *sync.WaitGroup, wssClient *ethclient.Client, bot *tgbotapi.BotAPI, imageURL string) {
 	log.Println("Started monitoring for burns...")
 	defer waitGroup.Done()
 
@@ -167,14 +309,14 @@ func monitorBurns(ctx context.Context, waitGroup *sync.WaitGroup, wssClient *eth
 					break subscriptionLoop // exit inner loop on error
 				case vLog := <-logsChannel:
 					log.Printf("Log received: %+v", vLog)
-					processLog(ctx, vLog, wssClient, bot, channelID, imageURL)
+					processLog(ctx, vLog, wssClient, bot, imageURL)
 				}
 			}
 		}
 	}
 }
 
-func processLog(ctx context.Context, vLog types.Log, wssClient *ethclient.Client, bot *tgbotapi.BotAPI, channelID string, imageURL string) {
+func processLog(ctx context.Context, vLog types.Log, wssClient *ethclient.Client, bot *tgbotapi.BotAPI, imageURL string) {
 	// ABI for the smart contract (include only relevant events)
 	contractABI, err := abi.JSON(strings.NewReader(transferEventABI))
 	if err != nil {
@@ -199,14 +341,15 @@ func processLog(ctx context.Context, vLog types.Log, wssClient *ethclient.Client
 
 	log.Printf("Transfer Event: From %s To %s Value %s", event.From.Hex(), event.To.Hex(), event.Value.String())
 
-	notifyTelegram(ctx, event, wssClient, bot, channelID, imageURL)
+	notifyTelegram(ctx, event, wssClient, bot, imageURL)
 }
 
+// notifyTelegram sends burn notifications to all active channels
 func notifyTelegram(ctx context.Context, event struct {
 	From  common.Address
 	To    common.Address
 	Value *big.Int
-}, wssClient *ethclient.Client, bot *tgbotapi.BotAPI, channelID string, imageURL string) {
+}, wssClient *ethclient.Client, bot *tgbotapi.BotAPI, imageURL string) {
 	// Token has 18 decimals, so divide by 10^18
 	decimals := big.NewInt(1e18)
 	humanReadableValue := new(big.Float).Quo(new(big.Float).SetInt(event.Value), new(big.Float).SetInt(decimals))
@@ -265,12 +408,12 @@ Total Burned: %.2f%% of supply
 
 Burns: https://basescan.org/token/0x20d704099b62ada091028bcfc44445041ed16f09?a=0xea36d66f0ac9928b358400309a8dfbc43a973a35`,
 		humanReadableValue.String(),
-		percentBurned,
+		percentBurnedFloat,
 		randomMessage,
 	)
 
-	// SendburnAmount the message with the image
-	sendTelegramMessage(bot, channelID, message, imageURL, true)
+	// Send the message with the image to all active channels
+	sendTelegramMessage(bot, message, imageURL, true)
 
 	// Update the latest burn event
 	latestBurnEventMutex.Lock()
@@ -286,62 +429,32 @@ Burns: https://basescan.org/token/0x20d704099b62ada091028bcfc44445041ed16f09?a=0
 	latestBurnEventMutex.Unlock()
 }
 
-func main() {
-	// Load environment variables
-	loadEnv()
-	botToken := os.Getenv("TELEGRAM_BOT_TOKEN")
-	channel := os.Getenv("TELEGRAM_CHANNEL_ID")
-	wssURL := os.Getenv("ETHEREUM_WSS_URL")
-	//httpURL := os.Getenv("ETHEREUM_HTTP_URL")
-	imageURL := os.Getenv("IMAGE_URL")
+// sendTelegramMessage sends a message to all active channels
+func sendTelegramMessage(bot *tgbotapi.BotAPI, message string, mediaURL string, isGIF bool) {
+	log.Println("Sending message to Telegram channels...")
 
-	if len(botToken) == 0 || len(channel) == 0 || len(wssURL) == 0 || len(imageURL) == 0 {
-		log.Fatalf("environment variables not set")
-	}
+	activeChannelsMutex.RLock()
+	defer activeChannelsMutex.RUnlock()
 
-	var terminationSignalChannel = make(chan os.Signal, 1)
-	signal.Notify(terminationSignalChannel, os.Interrupt, syscall.SIGTERM)
-
-	// cancellable context
-	waitGroup := &sync.WaitGroup{}
-
-	// Connect to Ethereum client
-	log.Println("Connecting to WSS Ethereum client...")
-	wssClient, err := ethclient.Dial(wssURL)
-	if err != nil {
-		log.Fatalf("Failed to connect to Ethereum client: %v", err)
-	}
-	log.Println("Connected to WSS Ethereum client successfully")
-
-	// Create Telegram bot
-	log.Println("Initializing Telegram bot...")
-	bot, err := tgbotapi.NewBotAPI(botToken)
-	if err != nil {
-		log.Fatalf("Failed to create Telegram bot: %v", err)
-	}
-	log.Println("Telegram bot initialized successfully")
-
-	// Start health server to keep alive
-	server := startHTTPServer("0.0.0.0:8080")
-
-	// Prepare routine
-	ctx, cancel := context.WithCancel(context.Background())
-	waitGroup.Add(1)
-	// Start polling for burn events
-	go monitorBurns(ctx, waitGroup, wssClient, bot, channel, imageURL)
-
-	for {
-		select {
-		case <-terminationSignalChannel:
-			log.Println("Signal received, shutting down...")
-			cancel()
-		case <-ctx.Done():
-			fmt.Printf("shutting down server...")
-			server.SetKeepAlivesEnabled(false)
-			_ = server.Shutdown(ctx)
-			waitGroup.Wait()
-			fmt.Printf("shutting down successfully")
-			os.Exit(0)
+	for channelID := range activeChannels {
+		if isGIF {
+			// Send a GIF (Animation)
+			animation := tgbotapi.NewAnimation(channelID, tgbotapi.FileURL(mediaURL))
+			animation.Caption = message
+			if _, err := bot.Send(animation); err != nil {
+				log.Printf("Error sending message with GIF to channel %d: %v", channelID, err)
+			} else {
+				log.Printf("Message with GIF sent successfully to channel %d", channelID)
+			}
+		} else {
+			// Send an image
+			photo := tgbotapi.NewPhoto(channelID, tgbotapi.FileURL(mediaURL))
+			photo.Caption = message
+			if _, err := bot.Send(photo); err != nil {
+				log.Printf("Error sending message with photo to channel %d: %v", channelID, err)
+			} else {
+				log.Printf("Message with photo sent successfully to channel %d", channelID)
+			}
 		}
 	}
 }

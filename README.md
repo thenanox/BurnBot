@@ -1,8 +1,10 @@
 # Telegram bot to track burns in chaos token
 
-This is a bot that send messages to a telegram channel where the bot is added as admin. It tracks the burns from an ethereum network.
+This is a bot that send messages to a telegram channel where the bot is added as admin.. It tracks the burns from an ethereum network.
 
 Right now it is implemented to track one specific wallet burns in an specific contract, but can be easily extended.
+
+It can be started and stopped by telegram commands.
 
 To run it locally, it is needed to create an .env file like this:
 

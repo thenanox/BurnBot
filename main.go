@@ -413,7 +413,7 @@ Burns: https://basescan.org/token/0x20d704099b62ada091028bcfc44445041ed16f09?a=0
 	)
 
 	// Send the message with the image to all active channels
-	sendTelegramMessage(bot, message, imageURL, true)
+	sendTelegramMessage(bot, message, imageURL, false)
 
 	// Update the latest burn event
 	latestBurnEventMutex.Lock()
